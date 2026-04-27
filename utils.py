@@ -20,7 +20,7 @@ from rasterio.merge import merge
 from rasterio.mask import mask as rio_mask
 
 import pandas as pd
-import pyvista as pv
+import manifold3d as m3d
 
 wgs84 = CRS.from_epsg(4326)
 web_mercator = CRS.from_epsg(3857)
@@ -273,7 +273,7 @@ def load_gebco_region(tile_paths: list[str], polygon):
         polygon: A Shapely geometry (Polygon or MultiPolygon) in WGS84
     """
     # print(type(polygon))
-    polygon = polygon.geometry[0]
+    polygon = polygon.geometry.union_all()
     bbox = polygon.bounds  # (min_lon, min_lat, max_lon, max_lat)
     min_lon, min_lat, max_lon, max_lat = bbox
 
@@ -435,7 +435,23 @@ class Map:
         grid["depth"] = z.ravel(order="F")
         return grid
         
-    
+    def center_coords(self):
+        rows, cols = np.meshgrid(
+            np.arange(self.depth_raster.shape[0]),
+            np.arange(self.depth_raster.shape[1]),
+            indexing='ij'
+        )
+        lons, lats = rasterio.transform.xy(self.depth_transform, rows, cols)
+        return lons, lats
+
+    def ul_coords(self):
+        rows, cols = np.meshgrid(
+            np.arange(self.depth_raster.shape[0]),
+            np.arange(self.depth_raster.shape[1]),
+            indexing='ij'
+        )
+        lons, lats = rasterio.transform.xy(self.depth_transform, rows, cols, offset='ul')
+        return lons, lats
 
     def plot_mapped_raster(self):
         plt.figure(figsize=(10, 5))
@@ -474,8 +490,151 @@ class Map:
         
         return m
 
+    def seafloor_mesh(self, debug=False, make_solid=True, bottom_z=None, use_relative_meters=False):
+        """
+        Build a Manifold mesh from seafloor raster data.
 
-        
+        Manifold requires a closed (watertight) 2-manifold surface. A raw terrain
+        sheet is open, so by default this function creates a thin closed solid
+        using the seafloor as the top surface.
+
+        If bottom_z is not provided, the solid bottom is set to twice the depth
+        of Earth's deepest ocean point (-10,935 m), i.e. -21,870 m.
+
+        Set use_relative_meters=True to convert horizontal coordinates to meters
+        in metric_crs and translate them so the top-left raster point is (0, 0).
+        """
+        lon, lat = self.center_coords()
+        depth = np.asarray(self.depth_raster)
+        H, W = depth.shape
+
+        if debug:
+            print("seafloor_mesh shapes:", "lon", lon.shape, "lat", lat.shape, "depth", depth.shape)
+            print("seafloor_mesh dtypes:", "lon", lon.dtype, "lat", lat.dtype, "depth", depth.dtype)
+
+        lon = np.asarray(lon)
+        lat = np.asarray(lat)
+
+        if lon.shape == depth.shape and lat.shape == depth.shape:
+            lon_flat = lon.reshape(-1)
+            lat_flat = lat.reshape(-1)
+        elif lon.ndim == 1 and lat.ndim == 1 and lon.shape == lat.shape and lon.size == depth.size:
+            lon_flat = lon
+            lat_flat = lat
+        else:
+            raise ValueError(
+                f"Shape mismatch: lon={lon.shape}, lat={lat.shape}, depth={depth.shape}. "
+                "lon/lat must either match depth.shape or be flattened to depth.size."
+            )
+
+        if use_relative_meters:
+            to_metric = Transformer.from_crs(self.depth_crs, metric_crs, always_xy=True)
+            x_flat, y_flat = to_metric.transform(lon_flat, lat_flat)
+            x_flat = np.asarray(x_flat, dtype=np.float64)
+            y_flat = np.asarray(y_flat, dtype=np.float64)
+
+            x0_src, y0_src = rasterio.transform.xy(self.depth_transform, 0, 0, offset="center")
+            x0, y0 = to_metric.transform(x0_src, y0_src)
+            x_flat = x_flat - float(x0)
+            y_flat = y_flat - float(y0)
+        else:
+            x_flat = lon_flat
+            y_flat = lat_flat
+
+        depth_flat = depth.reshape(-1)
+        finite = np.isfinite(x_flat) & np.isfinite(y_flat) & np.isfinite(depth_flat)
+        if not np.all(finite):
+            bad = np.count_nonzero(~finite)
+            raise ValueError(
+                f"Seafloor mesh contains {bad} non-finite vertices. "
+                "Check the raster crop, nodata handling, and coordinate transform."
+            )
+
+        # --- Vertices ---
+        # Stack into (H*W, 3) array of [x, y, depth]
+        verts = np.column_stack([
+            x_flat,
+            y_flat,
+            depth_flat
+        ]).astype(np.float32)
+
+        if debug:
+            print("verts:", verts.shape, "min/max depth:", float(np.min(depth)), float(np.max(depth)))
+            if use_relative_meters:
+                print("relative meters x/y min/max:",
+                      (float(np.min(x_flat)), float(np.max(x_flat))),
+                      (float(np.min(y_flat)), float(np.max(y_flat))))
+
+        # --- Faces (triangles) ---
+        # For each grid cell (i,j), create 2 triangles:
+        #   (i,j) --- (i,j+1)
+        #     |  \       |
+        #   (i+1,j) - (i+1,j+1)
+        def idx(i, j):
+            return i * W + j
+
+        i, j = np.meshgrid(np.arange(H - 1), np.arange(W - 1), indexing='ij')
+        i, j = i.flatten(), j.flatten()
+
+        tri1 = np.column_stack([idx(i, j),     idx(i+1, j), idx(i+1, j+1)])
+        tri2 = np.column_stack([idx(i, j),     idx(i+1, j+1), idx(i,   j+1)])
+        faces = np.vstack([tri1, tri2]).astype(np.uint32)
+
+        if debug:
+            print("faces:", faces.shape, "expected triangles:", 2 * (H - 1) * (W - 1))
+
+        if make_solid:
+            n_top = verts.shape[0]
+            if bottom_z is None:
+                bottom_z = 2.0 * (-10935.0)
+            bottom_z = float(bottom_z)
+
+            # Bottom cap vertices directly below top vertices.
+            bottom_verts = verts.copy()
+            bottom_verts[:, 2] = bottom_z
+
+            # Top + bottom vertices.
+            verts = np.vstack([verts, bottom_verts]).astype(np.float32)
+
+            # Bottom cap triangles are top triangles with reversed winding.
+            bottom_faces = (faces[:, [0, 2, 1]] + n_top).astype(np.uint32)
+
+            # Side walls around outer raster perimeter.
+            perimeter = []
+            perimeter.extend([idx(0, c) for c in range(W)])
+            perimeter.extend([idx(r, W - 1) for r in range(1, H)])
+            perimeter.extend([idx(H - 1, c) for c in range(W - 2, -1, -1)])
+            perimeter.extend([idx(r, 0) for r in range(H - 2, 0, -1)])
+
+            side_tris = []
+            for k in range(len(perimeter)):
+                t0 = perimeter[k]
+                t1 = perimeter[(k + 1) % len(perimeter)]
+                b0 = t0 + n_top
+                b1 = t1 + n_top
+                side_tris.append([t0, t1, b1])
+                side_tris.append([t0, b1, b0])
+
+            side_faces = np.asarray(side_tris, dtype=np.uint32)
+            faces = np.vstack([faces, bottom_faces, side_faces]).astype(np.uint32)
+
+            if debug:
+                print("solid verts:", verts.shape)
+                print("solid faces:", faces.shape)
+                print("bottom_z:", bottom_z)
+
+        # --- Build Manifold mesh ---
+        mesh = m3d.Mesh(vert_properties=verts, tri_verts=faces)
+        manifold = m3d.Manifold(mesh=mesh)
+
+        if debug:
+            try:
+                print("manifold empty:", manifold.is_empty())
+            except Exception:
+                pass
+
+        return manifold
+            
 
     def plot_unmapped(self, m = None):
         if not m:
@@ -602,9 +761,9 @@ class Map:
         # print( self.depth_raster[row, col])
         return self.depth_raster[row, col]
 
-    def width_at(self, point):
+    def width_at_depth(self, depth):
+        depth= -depth
         s = self.beam["extinction"]
-        depth = -self.depth_at(point)
         s2 = s.reindex(s.index.union([depth])).sort_index()   
         extinction = s2.interpolate(method='index').loc[depth]
         result = depth * extinction
@@ -612,6 +771,11 @@ class Map:
             return 0.0
             raise ValueError(f"Non-finite width calculated at point {point}. Depth: {depth}, Extinction: {extinction}")
         return result
+
+    def width_at(self, point):
+        depth = self.depth_at(point)
+        return self.width_at_depth(depth)
+
 
     
 
