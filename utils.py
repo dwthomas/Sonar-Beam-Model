@@ -22,11 +22,64 @@ from rasterio.mask import mask as rio_mask
 import pandas as pd
 import manifold3d as m3d
 
+import trimesh
+import manifold3d as m3d
+import pyvista as pv
+
+
 wgs84 = CRS.from_epsg(4326)
 web_mercator = CRS.from_epsg(3857)
 metric_crs = web_mercator
 
 land_buffer_width = 3000
+
+def latlon_to_xy_displacement(lons, lats, lon0, lat0):
+    # Create an azimuthal equidistant projection centered on your origin point
+    aeqd_crs = CRS.from_proj4(f'+proj=aeqd +lat_0={lat0} +lon_0={lon0} +units=m')
+    transformer = Transformer.from_crs("EPSG:4326", aeqd_crs, always_xy=True)
+    
+    xs, ys = transformer.transform(lons, lats)  # returns meters from origin
+    return xs, ys
+
+
+def xy_displacement_to_latlon(xs, ys, lon0, lat0):
+    aeqd_crs = CRS.from_proj4(f'+proj=aeqd +lat_0={lat0} +lon_0={lon0} +units=m')
+    transformer = Transformer.from_crs(aeqd_crs, "EPSG:4326", always_xy=True)
+    
+    lons, lats = transformer.transform(xs, ys)
+    return lons, lats
+
+
+def dem_to_structuredgrid(depth_grid, transform, lon0, lat0):
+    """
+    depth_grid: 2D numpy array from rasterio (rows, cols)
+    transform: Affine transform from rasterio dataset.transform
+    """
+    
+    nrows, ncols = depth_grid.shape
+    
+    # Generate pixel coordinates (col, row) for each cell
+    cols, rows = np.meshgrid(np.arange(ncols), np.arange(nrows))
+
+
+    
+    
+    # Convert pixel coords to spatial coords using the affine transform
+    xs, ys = transform * (cols, rows)
+
+    print(xs, ys)
+    xs, ys = latlon_to_xy_displacement(xs, ys, lon0, lat0)
+    
+    zs = depth_grid  # use depth values as Z (negate if depths are positive-down)
+    print(zs.min(), zs.max()) 
+
+    # PyVista StructuredGrid expects (X, Y, Z) each of shape (nrows, ncols)
+    grid = pv.StructuredGrid(xs, ys, zs)
+    print(grid.dimensions)   # e.g. (500, 300, 1)
+    print(grid.points.shape) # e.g. (150000, 3)
+    print(xs.shape) 
+    
+    return grid
 
 def existing_dir(path_str: str) -> str:
     path = Path(path_str)
@@ -211,6 +264,48 @@ def combine_almost_continuous_lines(multi_line, tolerance=10):
             return LineString([pt for line in ordered_lines for pt in line.coords])
 
     raise ValueError("Cannot combine lines into a single continuous LineString")
+
+
+def transform_coords(coords, lon0, lat0):
+    xs, ys = zip(*coords)
+    lons, lats = xy_displacement_to_latlon(np.array(xs), np.array(ys), lon0, lat0)
+    return list(zip(lons, lats))
+
+def transform_polygon(poly, lon0, lat0):
+    exterior = transform_coords(poly.exterior.coords, lon0, lat0)
+    interiors = [transform_coords(ring.coords, lon0, lat0) for ring in poly.interiors]
+    return Polygon(exterior, interiors)
+
+def polydata_to_shapely(mesh, lon0, lat0):
+    # Get points projected to XY plane
+    mesh = mesh.triangulate()
+    points_2d = mesh.points[:, :2]  # drop Z
+
+    # Extract triangles from faces
+    # pyvista face array is [n_verts, i, j, k, n_verts, i, j, k, ...]
+    faces = mesh.faces.reshape(-1, 4)[:, 1:]  # strip the leading "3"
+
+    # Build a shapely polygon for each triangle
+    triangles = []
+    for tri in faces:
+        coords = points_2d[tri]
+        poly = Polygon(coords)
+        if poly.is_valid and not poly.is_empty:
+            triangles.append(poly)
+
+    # Merge all triangles into a single shape
+    combined = unary_union(triangles)
+
+    # Transform coordinates back to lat/lon
+
+
+    if isinstance(combined, MultiPolygon):
+        combined = MultiPolygon([transform_polygon(p, lon0, lat0) for p in combined.geoms])
+    else:
+        combined = transform_polygon(combined, lon0, lat0)
+        
+    return combined
+
 
 def get_pos(lat, lng):
     return lat, lng
@@ -777,6 +872,113 @@ class Map:
         return self.width_at_depth(depth)
 
 
+    def survey_line(self, line):
+        gdf_m = line.to_crs(metric_crs)
+        line_m = gdf_m.geometry.iloc[0]
+        to_wgs84 = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
+
+        step = 1000  # meters
+        length = line_m.length
+        distances = np.arange(0, length + step, step)
+
+        def unit(v):
+            return v / np.linalg.norm(v)
+        
+        left_pts = []
+        right_pts = []
+        
+        for s in distances:
+            p = line_m.interpolate(s)
+        
+            # tangent via finite difference
+            eps = 1.0
+            s1 = max(s - eps, 0)
+            s2 = min(s + eps, length)
+        
+            p1 = line_m.interpolate(s1)
+            p2 = line_m.interpolate(s2)
+            # print(p, p1, p2)
+            t = np.array([p2.x - p1.x, p2.y - p1.y])
+            try:
+                t = unit(t)
+            except:
+                continue
+        
+            # perpendicular normal
+            n = np.array([-t[1], t[0]])
+        
+            # convert sample point → WGS84 for width()
+            lon, lat = to_wgs84.transform(p.x, p.y)
+            p_wgs84 = Point(lon, lat)
+            try:
+                w = self.width_at(p_wgs84) / 2.0   # meters
+            except:
+                continue
+            left = Point(p.x + n[0]*w, p.y + n[1]*w)
+            right = Point(p.x - n[0]*w, p.y - n[1]*w)
+
+            if np.isfinite(left.x) and np.isfinite(left.y):
+                left_pts.append(left)
+            if np.isfinite(right.x) and np.isfinite(right.y):
+                right_pts.append(right)
+        
+    
+            # print(left, right)
+
+        poly_m = Polygon(list(left_pts) + list(reversed(right_pts)))
+        poly_wgs84 = gpd.GeoSeries([poly_m], crs=metric_crs).to_crs("EPSG:4326").iloc[0]
+        poly_gdf = gpd.GeoDataFrame(geometry=[poly_wgs84], crs="EPSG:4326")
+
+        lefts = gpd.GeoDataFrame(geometry = [LineString(list(left_pts))], crs = metric_crs).to_crs("EPSG:4326")
+        rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = metric_crs).to_crs("EPSG:4326")
+        return poly_gdf, lefts, rights
+
+    def survey_line_3D(self, line):
+        gdf_m = line.to_crs(metric_crs)
+        line_m = gdf_m.geometry.iloc[0]
+        to_wgs84 = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
+        
+        lon0, lat0 = line.loc[0].geometry.coords[0]
+
+
+        # create a structured grid mesh of the seafloor
+        depth_grid = self.depth_raster.astype(float)
+        depth_grid[depth_grid >= -2] = 2*np.nanmin(depth_grid.flatten())
+        sg = dem_to_structuredgrid(depth_grid, self.depth_transform, lon0, lat0)
+        seafloor_mesh = sg.extract_surface(algorithm ='dataset_surface')
+
+        # create a 2D model of the sonar beam
+        points1 = [(0, 0)]
+        points2 = []
+        for depth in self.beam.index:
+            width = self.width_at_depth(-depth)
+            points1.append((float(-width/2), -depth))
+            points2.append((float(width/2), -depth))
+        pgon = Polygon(points1 + list(reversed(points2)))
+
+        # create a 3D model of the sonar beam by extruding the 2D model along the survey line
+        line_lons, line_lats = zip(*line.geometry[0].coords)  # unpack lon, lat pairs
+
+        line_xs, line_ys = latlon_to_xy_displacement(
+            np.array(line_lons),
+            np.array(line_lats),
+            lon0, lat0
+        )
+
+        line_points = np.column_stack([line_xs, line_ys, np.zeros(len(line_xs))])
+        mesh = trimesh.creation.sweep_polygon(pgon, line_points)
+        mesh.vertices[:, 2] *= -1
+        beam_pv = pv.wrap(mesh)
+        tri_seafloor = seafloor_mesh.triangulate()
+
+        # find their intersection, then project to latlon
+        clipped = seafloor_mesh.clip_surface(beam_pv, invert=False)
+
+        clipped_flattened = polydata_to_shapely(clipped, lon0, lat0)
+
+        poly_gdf = gpd.GeoDataFrame(geometry = [clipped_flattened], crs = wgs84)
+            
+        return poly_gdf, None, None
     
 
 def get_polys():
