@@ -67,17 +67,17 @@ def dem_to_structuredgrid(depth_grid, transform, lon0, lat0):
     # Convert pixel coords to spatial coords using the affine transform
     xs, ys = transform * (cols, rows)
 
-    print(xs, ys)
+    # print(xs, ys)
     xs, ys = latlon_to_xy_displacement(xs, ys, lon0, lat0)
     
     zs = depth_grid  # use depth values as Z (negate if depths are positive-down)
-    print(zs.min(), zs.max()) 
+    # print(zs.min(), zs.max()) 
 
     # PyVista StructuredGrid expects (X, Y, Z) each of shape (nrows, ncols)
     grid = pv.StructuredGrid(xs, ys, zs)
-    print(grid.dimensions)   # e.g. (500, 300, 1)
-    print(grid.points.shape) # e.g. (150000, 3)
-    print(xs.shape) 
+    # print(grid.dimensions)   # e.g. (500, 300, 1)
+    # print(grid.points.shape) # e.g. (150000, 3)
+    # print(xs.shape) 
     
     return grid
 
