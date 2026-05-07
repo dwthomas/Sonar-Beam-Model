@@ -310,6 +310,56 @@ def polydata_to_shapely(mesh, lon0, lat0):
 def get_pos(lat, lng):
     return lat, lng
 
+
+def _unwrap_lon_pair(lon1, lon2):
+    """Return lon2 shifted by +/-360 so it is closest to lon1."""
+    delta = lon2 - lon1
+    if delta > 180:
+        return lon2 - 360
+    if delta < -180:
+        return lon2 + 360
+    return lon2
+
+
+def _normalize_lon(lon):
+    return ((lon + 180) % 360) - 180
+
+
+def _closest_lon_to_ref(lon, ref_lon):
+    """Shift lon by k*360 so it is closest to ref_lon."""
+    return lon + 360 * round((ref_lon - lon) / 360)
+
+
+def _lon_ranges_overlap(lon1_min, lon1_max, lon2_min, lon2_max):
+    """Check if two longitude ranges overlap, accounting for dateline wrapping.
+    
+    A longitude range wraps if min > max (e.g., 170 to -170 wraps across ±180).
+    Two ranges overlap if they share any longitude values on the globe.
+    """
+    # Normalize: if a range is wrapped (min > max), split into two normal ranges
+    # and check if either part overlaps.
+    
+    r1_wraps = lon1_min > lon1_max
+    r2_wraps = lon2_min > lon2_max
+    
+    if not r1_wraps and not r2_wraps:
+        # Neither wraps: simple overlap test
+        return lon1_min < lon2_max and lon1_max > lon2_min
+    
+    if r1_wraps and not r2_wraps:
+        # r1 wraps (e.g., 170 to -170): splits into [170, 180] and [-180, -170]
+        # r2 is normal: check if r2 overlaps either part
+        return (lon2_min < 180 and lon2_max > lon1_min) or (lon2_min < lon1_max and lon2_max > -180)
+    
+    if not r1_wraps and r2_wraps:
+        # r2 wraps: splits into [lon2_min, 180] and [-180, lon2_max]
+        # r1 is normal: check if r1 overlaps either part
+        return (lon1_min < 180 and lon1_max > lon2_min) or (lon1_min < lon2_max and lon1_max > -180)
+    
+    # Both wrap: both split across dateline, so they definitely overlap
+    return True
+
+
 def line_to_ellipse(line, width, metric_crs = web_mercator, resolution=64):
     """
     Constructs a GeoDataFrame of ellipses where each ellipse has the two points 
@@ -326,12 +376,34 @@ def line_to_ellipse(line, width, metric_crs = web_mercator, resolution=64):
     """
     ellipses = []
 
-    metric_line = line.to_crs(metric_crs)
+    # Work in geographic coordinates first so each segment can be unwrapped
+    # across the antimeridian before local metric projection.
+    line_wgs84 = line.to_crs(wgs84)
+    coords = list(line_wgs84.geometry.iloc[0].coords)
 
     # Iterate through each segment of the line
-    for i in range(len(metric_line.geometry[0].coords) - 1):
-        p1 = Point(metric_line.geometry[0].coords[i])
-        p2 = Point(metric_line.geometry[0].coords[i + 1])
+    for i in range(len(coords) - 1):
+        lon1, lat1 = coords[i]
+        lon2_raw, lat2 = coords[i + 1]
+
+        # If a segment crosses the dateline, shift endpoint longitude so
+        # geometric operations see the short arc rather than a seam jump.
+        lon2 = _unwrap_lon_pair(lon1, lon2_raw)
+
+        center_lon = (lon1 + lon2) / 2.0
+        center_lat = (lat1 + lat2) / 2.0
+        center_lon_norm = _normalize_lon(center_lon)
+
+        local_crs = CRS.from_proj4(
+            f"+proj=aeqd +lat_0={center_lat} +lon_0={center_lon_norm} +datum=WGS84 +units=m"
+        )
+        to_metric = Transformer.from_crs(wgs84, local_crs, always_xy=True)
+        to_wgs = Transformer.from_crs(local_crs, wgs84, always_xy=True)
+
+        x1, y1 = to_metric.transform(lon1, lat1)
+        x2, y2 = to_metric.transform(lon2, lat2)
+        p1 = Point(x1, y1)
+        p2 = Point(x2, y2)
 
         # Calculate the center of the ellipse
         center = Point((p1.x + p2.x) / 2, (p1.y + p2.y) / 2)
@@ -339,26 +411,31 @@ def line_to_ellipse(line, width, metric_crs = web_mercator, resolution=64):
         # Calculate the distance between the two foci
         foci_distance = p1.distance(p2)
 
-        # Calculate the semi-major axis (half of the width)
-        semi_major = (width + foci_distance)/ 2        
-
-        # Calculate the semi-minor axis using the ellipse formula
-        semi_minor = (semi_major**2 - (foci_distance / 2)**2)**0.5
+        # Calculate ellipse axes from focal distance and path width
+        semi_major = (width + foci_distance) / 2
+        semi_minor_sq = semi_major**2 - (foci_distance / 2) ** 2
+        semi_minor = np.sqrt(max(semi_minor_sq, 0.0))
 
         # Create a unit circle and scale it to the ellipse dimensions
-        ellipse = shapely.affinity.scale(center.buffer(1, resolution=resolution), xfact=semi_major, yfact=semi_minor)
+        ellipse = shapely.affinity.scale(
+            center.buffer(1, resolution=resolution), xfact=semi_major, yfact=semi_minor
+        )
 
-        # Calculate the angle of rotation (in degrees) to align the ellipse with the line segment
+        # Calculate segment bearing in local metric plane and rotate ellipse
         angle = np.degrees(np.arctan2(p2.y - p1.y, p2.x - p1.x))
+        ellipse = shapely.affinity.rotate(ellipse, angle, origin="center")
 
-        # Rotate the ellipse around its center
-        ellipse = shapely.affinity.rotate(ellipse, angle, origin='center')
+        # Transform ellipse coordinates back to lon/lat. Keep longitudes near
+        # the segment center to avoid reintroducing seam jumps.
+        lonlat_coords = []
+        for x, y in ellipse.exterior.coords:
+            lon, lat = to_wgs.transform(x, y)
+            lon_adj = _closest_lon_to_ref(lon, center_lon)
+            lonlat_coords.append((lon_adj, lat))
 
-        # Append the ellipse to the list
-        ellipses.append(ellipse)
-    # Create a GeoDataFrame from the ellipses
-    gdf = gpd.GeoDataFrame(geometry=ellipses, crs=metric_line.crs)
+        ellipses.append(Polygon(lonlat_coords))
 
+    gdf = gpd.GeoDataFrame(geometry=ellipses, crs=wgs84)
     return gdf.to_crs(line.crs)
 
 def load_gebco_region(tile_paths: list[str], polygon):
@@ -372,13 +449,17 @@ def load_gebco_region(tile_paths: list[str], polygon):
     bbox = polygon.bounds  # (min_lon, min_lat, max_lon, max_lat)
     min_lon, min_lat, max_lon, max_lat = bbox
 
-    # Find overlapping tiles using bounding box (fast)
+    # Find overlapping tiles using bounding box (fast), with dateline safety
     overlapping = []
+
     for path in tile_paths:
         with rasterio.open(path) as src:
             b = src.bounds
-            if b.left < max_lon and b.right > min_lon and b.bottom < max_lat and b.top > min_lat:
-                overlapping.append(path)
+            # Check latitude overlap (simple, no wrapping)
+            if b.bottom < max_lat and b.top > min_lat:
+                # Check longitude overlap accounting for dateline wrapping
+                if _lon_ranges_overlap(b.left, b.right, min_lon, max_lon):
+                    overlapping.append(path)
 
     if not overlapping:
         raise ValueError("No GEBCO tiles overlap the requested polygon.")
@@ -549,8 +630,9 @@ class Map:
         return lons, lats
 
     def plot_mapped_raster(self):
+        import matplotlib.pyplot as plt
         plt.figure(figsize=(10, 5))
-        plt.imshow(self.mapped_raster, cmap="Blues_r")
+        plt.imshow(self.unmapped_raster, cmap="Blues_r")
         plt.colorbar(label="TID")
         plt.title("GEBCO 2025 Bathymetry")
         plt.xlabel("Longitude")
@@ -566,6 +648,7 @@ class Map:
 
 
     def plot_land(self, m = None):
+        import folium
         if not m:
             m = folium.Map(location=[lat1, lon1],  zoom_start=8, tiles="Esri.OceanBasemap")
 
@@ -732,13 +815,12 @@ class Map:
             
 
     def plot_unmapped(self, m = None):
+        import folium
         if not m:
-            m = folium.Map(location=[lat1, lon1], zoom_start=8, tiles="Esri.OceanBasemap")
+            m = folium.Map( zoom_start=8, tiles="Esri.OceanBasemap")
         folium.GeoJson(
             self.unmapped_polygons,
             style_function=lambda feature: {
-                "fillColor": feature["properties"]["color"],
-                "color": feature["properties"]["color"],
                 "weight": 1,
                 "fillOpacity": 0.6,
             },
