@@ -26,6 +26,9 @@ import trimesh
 import manifold3d as m3d
 import pyvista as pv
 
+import pyvista_manifold
+
+
 
 wgs84 = CRS.from_epsg(4326)
 web_mercator = CRS.from_epsg(3857)
@@ -80,6 +83,63 @@ def dem_to_structuredgrid(depth_grid, transform, lon0, lat0):
     # print(xs.shape) 
     
     return grid
+
+def strip_arrays(mesh):
+    for name in list(mesh.cell_data.keys()):
+        mesh.cell_data.remove(name)
+    for name in list(mesh.point_data.keys()):
+        mesh.point_data.remove(name)
+    return mesh
+
+def close_seafloor(mesh, margin=1000):
+    mesh = strip_arrays(mesh.triangulate().clean())
+    z_min = mesh.bounds[4]
+    extrude_depth = abs(z_min) + margin
+
+    solid = mesh.extrude([0, 0, -extrude_depth], capping=True)
+    solid = strip_arrays(solid)
+    solid = strip_arrays(solid.extract_surface(algorithm='dataset_surface'))
+    solid = strip_arrays(solid.triangulate())
+    solid = strip_arrays(solid.clean())
+
+    # print(f"n_open_edges: {solid.n_open_edges}, is_valid: {solid.manifold.is_valid}, status: {solid.manifold.status}")
+    return solid
+
+
+# def clip_open_surface(seafloor_mesh, beam_pv):
+#     selected = seafloor_mesh.select_interior_points(beam_pv)
+#     inside_mask = selected['SelectedPoints'].astype(bool)
+    
+#     seafloor_mesh.point_data['inside'] = inside_mask.astype(int)
+#     clipped = seafloor_mesh.threshold(
+#         value=0.5,
+#         scalars='inside',
+#         preference='point',
+#         method='upper'
+#     )
+#     clipped = clipped.extract_surface(algorithm='dataset_surface')
+#     clipped.point_data.remove('inside')
+    
+#     print(f"clip_open_surface result: {clipped.n_cells} cells")
+#     return clipped
+
+def clip_open_surface(seafloor_mesh, beam_pv):
+    selected = seafloor_mesh.select_interior_points(beam_pv, method='cell_locator')
+    inside_mask = selected.point_data['selected_points'].astype(bool)
+    # print(f"Points inside: {inside_mask.sum()} / {len(inside_mask)}")
+
+    seafloor_mesh = seafloor_mesh.copy()
+    seafloor_mesh.point_data['inside'] = inside_mask.astype(int)
+    clipped = seafloor_mesh.threshold(
+        value=0.5,
+        scalars='inside',
+        preference='point',
+        method='upper'
+    )
+    clipped = clipped.extract_surface(algorithm='dataset_surface')
+    clipped.point_data.remove('inside')
+    # print(f"clip_open_surface result: {clipped.n_cells} cells")
+    return clipped
 
 def existing_dir(path_str: str) -> str:
     path = Path(path_str)
@@ -1025,6 +1085,8 @@ class Map:
         rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = metric_crs).to_crs("EPSG:4326")
         return poly_gdf, lefts, rights
 
+   
+
     def survey_line_3D(self, line):
         gdf_m = line.to_crs(metric_crs)
         line_m = gdf_m.geometry.iloc[0]
@@ -1064,8 +1126,23 @@ class Map:
         tri_seafloor = seafloor_mesh.triangulate()
 
         # find their intersection, then project to latlon
-        clipped = seafloor_mesh.clip_surface(beam_pv, invert=False)
+        # print("seafloor is_valid:", seafloor_mesh.manifold.is_valid)
+        # print("seafloor n_open_edges:", seafloor_mesh.n_open_edges)
+        # print("beam is_valid:", beam_pv.manifold.is_valid)
+        # print("beam n_open_edges:", beam_pv.n_open_edges)
+        # seafloor_solid = close_seafloor(seafloor_mesh)
+        # clipped = seafloor_solid.clip_surface(beam_pv, invert=False)
+        # print(clipped)
+        # clipped = seafloor_solid.manifold.intersection(beam_pv)
+        # print(clipped)
 
+        # Try manifold first, fall back to select_enclosed_points
+        seafloor_solid = close_seafloor(seafloor_mesh)
+        if seafloor_solid.manifold.is_valid:
+            clipped = seafloor_solid.manifold.intersection(beam_pv)
+        else:
+            # print("Manifold repair failed, using select_enclosed_points")
+            clipped = clip_open_surface(seafloor_mesh, beam_pv)
         clipped_flattened = polydata_to_shapely(clipped, lon0, lat0)
 
         poly_gdf = gpd.GeoDataFrame(geometry = [clipped_flattened], crs = wgs84)
