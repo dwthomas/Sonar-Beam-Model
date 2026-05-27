@@ -504,12 +504,22 @@ def load_gebco_region(tile_paths: list[str], polygon):
     return data[0], transform, crs 
 
 
-def load_raster(filename, bbox):
+def load_raster(filename, bbox=None):
     with rasterio.open(filename) as ds:
-        window = from_bounds(*bbox, transform=ds.transform)
-        crs = ds.crs
-        transform = rasterio.windows.transform(window, ds.transform)
-        return ds.read(1, window=window), transform, crs
+        if bbox is not None:
+            window = from_bounds(*bbox, transform=ds.transform)
+            transform = rasterio.windows.transform(window, ds.transform)
+            data = ds.read(1, window=window)
+        else:
+            transform = ds.transform
+            data = ds.read(1)
+        
+        return data, transform, ds.crs
+
+def preprocess_map(raster_filepath, extinction_file = "EM302nautilus.txt"):
+    beam = load_beam(extinction_file)
+    raster, transform, crs = load_raster(raster_filepath)
+
 
 
 class Map:
