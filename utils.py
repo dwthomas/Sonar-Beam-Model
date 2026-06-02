@@ -27,6 +27,7 @@ import manifold3d as m3d
 import pyvista as pv
 
 import pyvista_manifold
+from PIL import Image
 
 
 
@@ -531,7 +532,7 @@ def load_gebco_region(tile_paths: list[str], polygon):
 
     if len(overlapping) == 1:
         with rasterio.open(overlapping[0]) as src:
-            data, transform = rio_mask(src, geom, crop=True, nodata=-1)
+            data, transform = rio_mask(src, geom, crop=True, nodata=0)
             crs = src.crs
     else:
         # Mosaic tiles first, then mask to polygon
@@ -559,7 +560,7 @@ def load_gebco_region(tile_paths: list[str], polygon):
                 transform=mosaic_transform,
             ) as mem_ds:
                 mem_ds.write(mosaic)
-                data, transform = rio_mask(mem_ds, geom, crop=True, nodata=-1)
+                data, transform = rio_mask(mem_ds, geom, crop=True, nodata=0)
 
     return data[0], transform, crs 
 
@@ -593,7 +594,11 @@ class Map:
         # self.land_raster = (255 * (self.depth_raster < 0)).astype(np.uint8)
         self.land_raster = (self.tid_raster == 0).astype(np.uint8)
         self.tid_raster = self.tid_raster.astype(np.uint8)
-        self.unmapped_raster = (self.tid_raster != 11).astype(np.uint8)  # (self.tid_raster > 17) * (1 - self.land_raster)
+        self.unmapped_raster = ((self.tid_raster != 11)).astype(np.uint8)  # (self.tid_raster > 17) * (1 - self.land_raster)
+        # save unmapped raster as PNG for debugging/inspection
+        # img = (self.unmapped_raster * 255).astype(np.uint8)
+        # Image.fromarray(img).save("tmp_unmap.png")
+       
 
         # print(self.depth_raster.shape)
         # bbox = (-180.0, 0, 180, 90)
@@ -623,6 +628,8 @@ class Map:
                 unmapped_polygons.append(shape(geom))
         # Create GeoDataFrame
         self.unmapped_polygons  = gpd.GeoDataFrame(geometry=unmapped_polygons, crs=self.tid_crs)
+        # print(self.unmapped_polygons.to_json())
+
         merged = self.unmapped_polygons.geometry.union_all()
         self.unmapped_polygons = gpd.GeoDataFrame(
             geometry=[merged], crs=self.unmapped_polygons.crs
