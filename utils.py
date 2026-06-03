@@ -629,6 +629,7 @@ class Map:
         # Create GeoDataFrame
         self.unmapped_polygons  = gpd.GeoDataFrame(geometry=unmapped_polygons, crs=self.tid_crs)
         # print(self.unmapped_polygons.to_json())
+        print(self.unmapped_polygons.to_json())
 
         merged = self.unmapped_polygons.geometry.union_all()
         self.unmapped_polygons = gpd.GeoDataFrame(
