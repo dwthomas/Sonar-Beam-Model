@@ -1032,14 +1032,14 @@ class Map:
         return self.width_at_depth(depth)
 
 
-    def survey_line(self, line):
+    def survey_line(self, line, step = 1000):
         gdf_m = line.to_crs(metric_crs)
         line_m = gdf_m.geometry.iloc[0]
         to_wgs84 = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
 
-        step = 1000  # meters
         length = line_m.length
-        distances = np.arange(0, length + step, step)
+        distances = list(np.arange(0, length, step))
+        distances.append(length)  # ensure we include the endpoint
 
         def unit(v):
             return v / np.linalg.norm(v)
@@ -1093,7 +1093,25 @@ class Map:
         rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = metric_crs).to_crs("EPSG:4326")
         return poly_gdf, lefts, rights
 
-   
+    def simple_survey_line(self, line):
+        segments = [
+            LineString([start, end])
+            for l in line.geometry
+            for start, end in zip(l.coords[:-1], l.coords[1:])
+        ]
+        segments_gdf = gpd.GeoDataFrame(geometry=segments, crs=line.crs)
+        segmented = []
+
+        for segment in segments_gdf.geometry:
+            segment = gpd.GeoDataFrame(geometry=[segment], crs=line.crs)
+            poly, _, _ = self.survey_line(segment)
+            segmented.append(poly)
+        segmented = gpd.GeoDataFrame(geometry = pd.concat(segmented).geometry, crs = line.crs)
+
+        segmented_union = segmented.to_crs(metric_crs).union_all()
+        segmented = gpd.GeoDataFrame(geometry=[segmented_union], crs=metric_crs).to_crs(line.crs)
+        return segmented
+        
 
     def survey_line_3D(self, line):
         gdf_m = line.to_crs(metric_crs)
