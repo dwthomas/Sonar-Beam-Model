@@ -33,7 +33,10 @@ from PIL import Image
 
 wgs84 = CRS.from_epsg(4326)
 web_mercator = CRS.from_epsg(3857)
-metric_crs = web_mercator
+def metric_crs(center_lon):
+    return CRS.from_proj4(
+            f"+proj=merc +a=6378137 +b=6378137 +lon_0={center_lon} +datum=WGS84 +units=m"
+        )
 
 land_buffer_width = 3000
 
@@ -148,10 +151,10 @@ def existing_dir(path_str: str) -> str:
         raise argparse.ArgumentTypeError(f"Directory does not exist: {path_str}")
     return str(path)
 
-def line_to_metric_crs(line, metric_crs = metric_crs):
-    gdf_m = line.to_crs(metric_crs)
+def line_to_metric_crs(line, crs = metric_crs):
+    gdf_m = line.to_crs(crs)
     plan_m = gdf_m.geometry.iloc[0]
-    to_wgs84 = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
+    to_wgs84 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
     return plan_m, to_wgs84
 
 def remove_holes(polygon):
@@ -421,7 +424,7 @@ def _lon_ranges_overlap(lon1_min, lon1_max, lon2_min, lon2_max):
     return True
 
 
-def line_to_ellipse(line, width, metric_crs = web_mercator, resolution=64):
+def line_to_ellipse(line, width, crs = web_mercator, resolution=64):
     """
     Constructs a GeoDataFrame of ellipses where each ellipse has the two points 
     from each segment of the line as the foci, and the sum of distances that 
@@ -455,9 +458,7 @@ def line_to_ellipse(line, width, metric_crs = web_mercator, resolution=64):
         center_lat = (lat1 + lat2) / 2.0
         center_lon_norm = _normalize_lon(center_lon)
 
-        local_crs = CRS.from_proj4(
-            f"+proj=aeqd +lat_0={center_lat} +lon_0={center_lon_norm} +datum=WGS84 +units=m"
-        )
+        local_crs = crs
         to_metric = Transformer.from_crs(wgs84, local_crs, always_xy=True)
         to_wgs = Transformer.from_crs(local_crs, wgs84, always_xy=True)
 
@@ -1033,9 +1034,11 @@ class Map:
 
 
     def survey_line(self, line, step = 1000):
-        gdf_m = line.to_crs(metric_crs)
+        centroid = line.geometry.iloc[0].centroid
+        crs = metric_crs(centroid.x)
+        gdf_m = line.to_crs(crs)
         line_m = gdf_m.geometry.iloc[0]
-        to_wgs84 = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
+        to_wgs84 = Transformer.from_crs(crs, wgs84, always_xy=True)
 
         length = line_m.length
         distances = list(np.arange(0, length, step))
@@ -1086,14 +1089,16 @@ class Map:
             # print(left, right)
 
         poly_m = Polygon(list(left_pts) + list(reversed(right_pts)))
-        poly_wgs84 = gpd.GeoSeries([poly_m], crs=metric_crs).to_crs("EPSG:4326").iloc[0]
-        poly_gdf = gpd.GeoDataFrame(geometry=[poly_wgs84], crs="EPSG:4326")
+        poly_wgs84 = gpd.GeoSeries([poly_m], crs=crs).to_crs(wgs84).iloc[0]
+        poly_gdf = gpd.GeoDataFrame(geometry=[poly_wgs84], crs=wgs84)
 
-        lefts = gpd.GeoDataFrame(geometry = [LineString(list(left_pts))], crs = metric_crs).to_crs("EPSG:4326")
-        rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = metric_crs).to_crs("EPSG:4326")
+        lefts = gpd.GeoDataFrame(geometry = [LineString(list(left_pts))], crs = crs).to_crs(wgs84)
+        rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = crs).to_crs(wgs84)
         return poly_gdf, lefts, rights
 
     def simple_survey_line(self, line):
+        centroid = line.geometry.iloc[0].centroid
+        crs = metric_crs(centroid.x)
         segments = [
             LineString([start, end])
             for l in line.geometry
@@ -1108,8 +1113,8 @@ class Map:
             segmented.append(poly)
         segmented = gpd.GeoDataFrame(geometry = pd.concat(segmented).geometry, crs = line.crs)
 
-        segmented_union = segmented.to_crs(metric_crs).union_all()
-        segmented = gpd.GeoDataFrame(geometry=[segmented_union], crs=metric_crs).to_crs(line.crs)
+        segmented_union = segmented.to_crs(crs).union_all()
+        segmented = gpd.GeoDataFrame(geometry=[segmented_union], crs=crs).to_crs(line.crs)
         return segmented
         
 
