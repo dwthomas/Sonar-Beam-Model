@@ -905,7 +905,7 @@ class Map:
         ).add_to(m)
         return m
 
-    def shrink_unmapped_polygons(self):
+    def shrink_unmapped_polygons(self, overlap_factor = 0.15):
         shrunk = []
         for pgon in self.unmapped_polygons.geometry:
             centroid = pgon.centroid
@@ -915,7 +915,7 @@ class Map:
             pgon_merc = pgon_merc.simplify(.005)
 
             pgon_merc = pgon_merc.to_crs(web_mercator).iloc[0]
-            new_gon_merc = pgon_merc.buffer(-beam_width / 2)
+            new_gon_merc = pgon_merc.buffer(-beam_width*(1 - overlap_factor) / 2)
             if new_gon_merc.area > 0:
                 new_gon = gpd.GeoSeries([new_gon_merc], crs=web_mercator).to_crs(self.unmapped_polygons.crs).iloc[0]
                 shrunk.append(new_gon)
