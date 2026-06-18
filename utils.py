@@ -600,45 +600,48 @@ def preprocess_map(raster_filepath, extinction_file = "EM302nautilus.txt"):
 
 
 class Map:
-    def __init__(self, mask, gebco_folder, extinction_file = "EM302nautilus.txt"):
+    def __init__(self, mask, gebco_folder, extinction_file = "EM302nautilus.txt", unmapped_raster_path="gebco_raster_2026/gebco_2026_unmapped.tiff"):
         #print to stderr loading beam
         print("Loading beam data...", file=sys.stderr)
         self.beam = load_beam(extinction_file)
         print("Loading GEBCO TID Raster...", file=sys.stderr)
         tid_files = glob.glob(os.path.join(gebco_folder, "*_tid_*.tif"))
-        self.tid_raster, self.tid_transform, self.tid_crs = load_gebco_region(tid_files, mask)
-        with rasterio.open(
-            "tmptid.tif",
-            "w",
-            driver="GTiff",
-            height=self.tid_raster.shape[0],
-            width=self.tid_raster.shape[1],
-            count=1,
-            dtype=self.tid_raster.dtype,
-            crs=self.tid_crs,
-            transform=self.tid_transform,
-        ) as dst:
-            dst.write(self.tid_raster, 1)
+        self.land_raster, self.land_transform, self.land_crs = load_gebco_region(tid_files, mask)
+
+        print("Loading GEBCO unmapped Raster...", file=sys.stderr)
+        self.unmapped_raster, self.unmapped_transform, self.unmapped_crs = load_gebco_region([unmapped_raster_path], mask)
+        # with rasterio.open(
+        #     "tmptid.tif",
+        #     "w",
+        #     driver="GTiff",
+        #     height=self.tid_raster.shape[0],
+        #     width=self.tid_raster.shape[1],
+        #     count=1,
+        #     dtype=self.tid_raster.dtype,
+        #     crs=self.tid_crs,
+        #     transform=self.tid_transform,
+        # ) as dst:
+        #     dst.write(self.tid_raster, 1)
         print("Loading GEBCO Depth Raster...", file=sys.stderr)
         depth_files = glob.glob(os.path.join(gebco_folder, "*_sub_ice_*.tif"))
         self.depth_raster, self.depth_transform, self.depth_crs = load_gebco_region(depth_files, mask)
-        with rasterio.open(
-            "tmpdepth.tif",
-            "w",
-            driver="GTiff",
-            height=self.depth_raster.shape[0],
-            width=self.depth_raster.shape[1],
-            count=1,
-            dtype=self.depth_raster.dtype,
-            crs=self.depth_crs,
-            transform=self.depth_transform,
-        ) as dst:
-            dst.write(self.depth_raster, 1)
+        # with rasterio.open(
+        #     "tmpdepth.tif",
+        #     "w",
+        #     driver="GTiff",
+        #     height=self.depth_raster.shape[0],
+        #     width=self.depth_raster.shape[1],
+        #     count=1,
+        #     dtype=self.depth_raster.dtype,
+        #     crs=self.depth_crs,
+        #     transform=self.depth_transform,
+        # ) as dst:
+        #     dst.write(self.depth_raster, 1)
         
         # self.land_raster = (255 * (self.depth_raster < 0)).astype(np.uint8)
-        self.land_raster = (self.tid_raster == 0).astype(np.uint8)
-        self.tid_raster = self.tid_raster.astype(np.uint8)
-        self.unmapped_raster = ((self.tid_raster != 11) & (self.depth_raster <= 200)).astype(np.uint8)  # (self.tid_raster > 17) * (1 - self.land_raster)
+        self.land_raster = (self.land_raster == 0).astype(np.uint8)
+        # self.tid_raster = self.tid_raster.astype(np.uint8)
+        self.unmapped_raster = self.unmapped_raster.astype(np.uint8)#((self.unmapped_raster) & (self.depth_raster <= 200)).astype(np.uint8)  # (self.tid_raster > 17) * (1 - self.land_raster)
         # save unmapped raster as PNG for debugging/inspection
         # img = (self.unmapped_raster * 255).astype(np.uint8)
         # Image.fromarray(img).save("tmp_unmap.png")
@@ -654,12 +657,12 @@ class Map:
         for geom, value in shapes(
             self.land_raster,
             mask=self.land_raster,
-            transform=self.tid_transform
+            transform=self.land_transform
         ):
             if value == 1:
                 land_polygons.append(shape(geom))
         # Create GeoDataFrame
-        self.land_polygons = gpd.GeoDataFrame(geometry=land_polygons, crs=self.tid_crs)
+        self.land_polygons = gpd.GeoDataFrame(geometry=land_polygons, crs=self.land_crs)
         self.grow_land_polygons()
         print("Generating Unmapped Polygons...", file=sys.stderr)
         #polygonize unmapped
@@ -667,12 +670,12 @@ class Map:
         for geom, value in shapes(
             self.unmapped_raster,
             mask=self.unmapped_raster,
-            transform=self.tid_transform
+            transform=self.unmapped_transform
         ):
             if value == 1:
                 unmapped_polygons.append(shape(geom))
         # Create GeoDataFrame
-        self.unmapped_polygons  = gpd.GeoDataFrame(geometry=unmapped_polygons, crs=self.tid_crs)
+        self.unmapped_polygons  = gpd.GeoDataFrame(geometry=unmapped_polygons, crs=self.unmapped_crs)
         # print(self.unmapped_polygons.to_json())
         # print(self.unmapped_polygons.to_json())
 
