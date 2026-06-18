@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import geopandas as gpd
 import shapely
@@ -552,19 +554,28 @@ def load_gebco_region(tile_paths: list[str], polygon):
             for ds in datasets:
                 ds.close()
 
+        # Wrap mosaic by adding copies to west and east for dateline wrapping
+        import numpy as np
+        wrapped_mosaic = np.concatenate([mosaic, mosaic, mosaic], axis=2)
+        
+        # Adjust transform for the wrapped mosaic
+        # The wrapped mosaic spans 3x the width, starting from -180 - width/3
+        pixel_width = mosaic_transform.a
+        wrapped_transform = mosaic_transform * rasterio.transform.Affine.translation(-mosaic.shape[2] * pixel_width, 0)
+
         # Write mosaic to a memory file, then apply polygon mask
         from rasterio.io import MemoryFile
         with MemoryFile() as memfile:
             with memfile.open(
                 driver="GTiff",
-                height=mosaic.shape[1],
-                width=mosaic.shape[2],
+                height=wrapped_mosaic.shape[1],
+                width=wrapped_mosaic.shape[2],
                 count=1,
-                dtype=mosaic.dtype,
+                dtype=wrapped_mosaic.dtype,
                 crs=crs,
-                transform=mosaic_transform,
+                transform=wrapped_transform,
             ) as mem_ds:
-                mem_ds.write(mosaic)
+                mem_ds.write(wrapped_mosaic)
                 data, transform = rio_mask(mem_ds, geom, crop=True, nodata=0)
 
     return data[0], transform, crs 
@@ -590,8 +601,10 @@ def preprocess_map(raster_filepath, extinction_file = "EM302nautilus.txt"):
 
 class Map:
     def __init__(self, mask, gebco_folder, extinction_file = "EM302nautilus.txt"):
+        #print to stderr loading beam
+        print("Loading beam data...", file=sys.stderr)
         self.beam = load_beam(extinction_file)
-        
+        print("Loading GEBCO TID Raster...", file=sys.stderr)
         tid_files = glob.glob(os.path.join(gebco_folder, "*_tid_*.tif"))
         self.tid_raster, self.tid_transform, self.tid_crs = load_gebco_region(tid_files, mask)
         with rasterio.open(
@@ -606,6 +619,7 @@ class Map:
             transform=self.tid_transform,
         ) as dst:
             dst.write(self.tid_raster, 1)
+        print("Loading GEBCO Depth Raster...", file=sys.stderr)
         depth_files = glob.glob(os.path.join(gebco_folder, "*_sub_ice_*.tif"))
         self.depth_raster, self.depth_transform, self.depth_crs = load_gebco_region(depth_files, mask)
         with rasterio.open(
@@ -624,7 +638,7 @@ class Map:
         # self.land_raster = (255 * (self.depth_raster < 0)).astype(np.uint8)
         self.land_raster = (self.tid_raster == 0).astype(np.uint8)
         self.tid_raster = self.tid_raster.astype(np.uint8)
-        self.unmapped_raster = ((self.tid_raster != 11)).astype(np.uint8)  # (self.tid_raster > 17) * (1 - self.land_raster)
+        self.unmapped_raster = ((self.tid_raster != 11) & (self.depth_raster <= 200)).astype(np.uint8)  # (self.tid_raster > 17) * (1 - self.land_raster)
         # save unmapped raster as PNG for debugging/inspection
         # img = (self.unmapped_raster * 255).astype(np.uint8)
         # Image.fromarray(img).save("tmp_unmap.png")
@@ -632,7 +646,8 @@ class Map:
 
         # print(self.depth_raster.shape)
         # bbox = (-180.0, 0, 180, 90)
-        
+        print("Generating Land Polygons...", file=sys.stderr)
+
         # left, bottom, right, top = bbox
         # Polygonize land        
         land_polygons = []
@@ -646,7 +661,7 @@ class Map:
         # Create GeoDataFrame
         self.land_polygons = gpd.GeoDataFrame(geometry=land_polygons, crs=self.tid_crs)
         self.grow_land_polygons()
-
+        print("Generating Unmapped Polygons...", file=sys.stderr)
         #polygonize unmapped
         unmapped_polygons = []
         for geom, value in shapes(
@@ -982,7 +997,7 @@ class Map:
 
         # Convert to row/col in window
         row, col = rowcol(self.depth_transform, x, y)
-        print("index", col, row, self.depth_raster.shape)
+        # print("index", col, row, self.depth_raster.shape)
         return int(col), int(row)
 
     def coords_of(self, col, row):
@@ -1046,7 +1061,7 @@ class Map:
             col = self.depth_raster.shape[1]-1
         # print(col, row)
         # print(self.depth_raster.shape)
-        print( "depth", self.depth_raster[row, col])
+        # print( "depth", self.depth_raster[row, col])
         return self.depth_raster[row, col]
 
     def width_at_depth(self, depth):
@@ -1067,7 +1082,7 @@ class Map:
 
     def survey_line(self, line, step = 1000):
         gdf_m = line
-        print("segment", line.to_crs(wgs84).geometry.iloc[0])
+        # print("segment", line.to_crs(wgs84).geometry.iloc[0])
         line_m = gdf_m.geometry.iloc[0]
         to_wgs84 = Transformer.from_crs(line.crs, wgs84, always_xy=True)
 
@@ -1106,7 +1121,7 @@ class Map:
             p_wgs84 = Point(lon, lat)
             try:
                 w = self.width_at(p_wgs84) / 2.0   # meters
-                print("width",p_wgs84, w)
+                # print("width",p_wgs84, w)
             except:
                 continue
             left = Point(p.x + n[0]*w, p.y + n[1]*w)
@@ -1129,7 +1144,7 @@ class Map:
         return poly_gdf, lefts, rights
 
     def simple_survey_line(self, line):
-        print("line", line.to_crs(wgs84).to_json())
+        # print("line", line.to_crs(wgs84).to_json())
         segments = [
             LineString([start, end])
             for l in line.geometry
@@ -1142,9 +1157,9 @@ class Map:
         for segment in segments_gdf.geometry:
             
             segment = gpd.GeoDataFrame(geometry=[segment], crs=line.crs)
-            print("seg", segment.to_crs(wgs84).geometry.iloc[0])
+            # print("seg", segment.to_crs(wgs84).geometry.iloc[0])
             poly, _, _ = self.survey_line(segment)
-            print("poly", poly.to_crs(wgs84).to_json())
+            # print("poly", poly.to_crs(wgs84).to_json())
             segmented.append(poly.to_crs(line.crs))
         segmented = gpd.GeoDataFrame(geometry = pd.concat(segmented).geometry, crs = line.crs)
 
