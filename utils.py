@@ -31,8 +31,9 @@ from PIL import Image
 
 
 
-wgs84 = CRS.from_epsg(4326)
-web_mercator = CRS.from_epsg(3857)
+# wgs84 = CRS.from_epsg(4326)
+wgs84 = CRS.from_proj4("+proj=longlat +datum=WGS84 +over")
+
 def metric_crs(center_lon):
     return CRS.from_proj4(
             f"+proj=merc +a=6378137 +b=6378137 +lon_0={center_lon} +datum=WGS84 +units=m"
@@ -43,15 +44,16 @@ land_buffer_width = 3000
 def latlon_to_xy_displacement(lons, lats, lon0, lat0):
     # Create an azimuthal equidistant projection centered on your origin point
     aeqd_crs = CRS.from_proj4(f'+proj=aeqd +lat_0={lat0} +lon_0={lon0} +units=m')
-    transformer = Transformer.from_crs("EPSG:4326", aeqd_crs, always_xy=True)
+    transformer = Transformer.from_crs(wgs84, aeqd_crs, always_xy=True)
     
     xs, ys = transformer.transform(lons, lats)  # returns meters from origin
     return xs, ys
 
 
+
 def xy_displacement_to_latlon(xs, ys, lon0, lat0):
     aeqd_crs = CRS.from_proj4(f'+proj=aeqd +lat_0={lat0} +lon_0={lon0} +units=m')
-    transformer = Transformer.from_crs(aeqd_crs, "EPSG:4326", always_xy=True)
+    transformer = Transformer.from_crs(aeqd_crs, wgs84, always_xy=True)
     
     lons, lats = transformer.transform(xs, ys)
     return lons, lats
@@ -154,7 +156,7 @@ def existing_dir(path_str: str) -> str:
 def line_to_metric_crs(line, crs = metric_crs):
     gdf_m = line.to_crs(crs)
     plan_m = gdf_m.geometry.iloc[0]
-    to_wgs84 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    to_wgs84 = Transformer.from_crs(crs, wgs84, always_xy=True)
     return plan_m, to_wgs84
 
 def remove_holes(polygon):
@@ -424,7 +426,7 @@ def _lon_ranges_overlap(lon1_min, lon1_max, lon2_min, lon2_max):
     return True
 
 
-def line_to_ellipse(line, width, crs = web_mercator, resolution=64):
+def line_to_ellipse(line, width, resolution=64):
     """
     Constructs a GeoDataFrame of ellipses where each ellipse has the two points 
     from each segment of the line as the foci, and the sum of distances that 
@@ -448,19 +450,19 @@ def line_to_ellipse(line, width, crs = web_mercator, resolution=64):
     # Iterate through each segment of the line
     for i in range(len(coords) - 1):
         lon1, lat1 = coords[i]
-        lon2_raw, lat2 = coords[i + 1]
+        lon2, lat2 = coords[i + 1]
 
         # If a segment crosses the dateline, shift endpoint longitude so
         # geometric operations see the short arc rather than a seam jump.
-        lon2 = _unwrap_lon_pair(lon1, lon2_raw)
+        # lon2 = _unwrap_lon_pair(lon1, lon2_raw)
+        # center_lon = (lon1 + lon2) / 2.0
+        # center_lat = (lat1 + lat2) / 2.0
+        # center_lon_norm = _normalize_lon(center_lon)
 
-        center_lon = (lon1 + lon2) / 2.0
-        center_lat = (lat1 + lat2) / 2.0
-        center_lon_norm = _normalize_lon(center_lon)
-
-        local_crs = crs
-        to_metric = Transformer.from_crs(wgs84, local_crs, always_xy=True)
-        to_wgs = Transformer.from_crs(local_crs, wgs84, always_xy=True)
+        line = gpd.GeoDataFrame(geometry=[shapely.geometry.LineString([(lon1, lat1), (lon2, lat2)])], crs=wgs84)
+        centroid = line.geometry.iloc[0].centroid
+        to_metric = Transformer.from_crs(wgs84, metric_crs(centroid.x), always_xy=True)
+        to_wgs = Transformer.from_crs(metric_crs(centroid.x), wgs84, always_xy=True)
 
         x1, y1 = to_metric.transform(lon1, lat1)
         x2, y2 = to_metric.transform(lon2, lat2)
@@ -492,7 +494,7 @@ def line_to_ellipse(line, width, crs = web_mercator, resolution=64):
         lonlat_coords = []
         for x, y in ellipse.exterior.coords:
             lon, lat = to_wgs.transform(x, y)
-            lon_adj = _closest_lon_to_ref(lon, center_lon)
+            lon_adj = _closest_lon_to_ref(lon, centroid.x)
             lonlat_coords.append((lon_adj, lat))
 
         ellipses.append(Polygon(lonlat_coords))
@@ -501,7 +503,7 @@ def line_to_ellipse(line, width, crs = web_mercator, resolution=64):
     return gdf.to_crs(line.crs)
 
 def load_gebco_region(tile_paths: list[str], polygon):
-    """
+    """  PROBLEM IS HERE
     Args:
         tile_paths: List of paths to all GEBCO .tif files
         polygon: A Shapely geometry (Polygon or MultiPolygon) in WGS84
@@ -509,26 +511,28 @@ def load_gebco_region(tile_paths: list[str], polygon):
     # print(type(polygon))
     polygon = polygon.geometry.union_all()
     bbox = polygon.bounds  # (min_lon, min_lat, max_lon, max_lat)
+    # bbox = (-180, -90, 180, 90)  # override for testing
     min_lon, min_lat, max_lon, max_lat = bbox
 
     # Find overlapping tiles using bounding box (fast), with dateline safety
     overlapping = []
 
     for path in tile_paths:
-        with rasterio.open(path) as src:
-            b = src.bounds
-            # Check latitude overlap (simple, no wrapping)
-            if b.bottom < max_lat and b.top > min_lat:
-                # Check longitude overlap accounting for dateline wrapping
-                if _lon_ranges_overlap(b.left, b.right, min_lon, max_lon):
-                    overlapping.append(path)
+        # with rasterio.open(path) as src:
+        #     b = src.bounds
+        #     # Check latitude overlap (simple, no wrapping)
+        #     if b.bottom < max_lat and b.top > min_lat:
+        #         # Check longitude overlap accounting for dateline wrapping
+        #         if _lon_ranges_overlap(b.left, b.right, min_lon, max_lon):
+        overlapping.append(path)
 
     if not overlapping:
         raise ValueError("No GEBCO tiles overlap the requested polygon.")
 
     # print(f"Found {len(overlapping)} overlapping tile(s).")
 
-    # Convert polygon to GeoJSON-like dict for rasterio
+    # Use the expanded bbox as the mask geometry so the clip window matches
+    # the crop bounds used for the raster merge.
     geom = [mapping(polygon)]
 
     if len(overlapping) == 1:
@@ -590,8 +594,33 @@ class Map:
         
         tid_files = glob.glob(os.path.join(gebco_folder, "*_tid_*.tif"))
         self.tid_raster, self.tid_transform, self.tid_crs = load_gebco_region(tid_files, mask)
+        with rasterio.open(
+            "tmptid.tif",
+            "w",
+            driver="GTiff",
+            height=self.tid_raster.shape[0],
+            width=self.tid_raster.shape[1],
+            count=1,
+            dtype=self.tid_raster.dtype,
+            crs=self.tid_crs,
+            transform=self.tid_transform,
+        ) as dst:
+            dst.write(self.tid_raster, 1)
         depth_files = glob.glob(os.path.join(gebco_folder, "*_sub_ice_*.tif"))
         self.depth_raster, self.depth_transform, self.depth_crs = load_gebco_region(depth_files, mask)
+        with rasterio.open(
+            "tmpdepth.tif",
+            "w",
+            driver="GTiff",
+            height=self.depth_raster.shape[0],
+            width=self.depth_raster.shape[1],
+            count=1,
+            dtype=self.depth_raster.dtype,
+            crs=self.depth_crs,
+            transform=self.depth_transform,
+        ) as dst:
+            dst.write(self.depth_raster, 1)
+        
         # self.land_raster = (255 * (self.depth_raster < 0)).astype(np.uint8)
         self.land_raster = (self.tid_raster == 0).astype(np.uint8)
         self.tid_raster = self.tid_raster.astype(np.uint8)
@@ -910,15 +939,17 @@ class Map:
         shrunk = []
         for pgon in self.unmapped_polygons.geometry:
             centroid = pgon.centroid
+            m_crs = metric_crs(centroid.x)
+
             # print(centroid)
             beam_width = self.width_at(centroid)
             pgon_merc = gpd.GeoSeries([pgon], crs=self.unmapped_polygons.crs)
             pgon_merc = pgon_merc.simplify(.005)
 
-            pgon_merc = pgon_merc.to_crs(web_mercator).iloc[0]
+            pgon_merc = pgon_merc.to_crs(m_crs).iloc[0]
             new_gon_merc = pgon_merc.buffer(-beam_width*(1 - overlap_factor) / 2)
             if new_gon_merc.area > 0:
-                new_gon = gpd.GeoSeries([new_gon_merc], crs=web_mercator).to_crs(self.unmapped_polygons.crs).iloc[0]
+                new_gon = gpd.GeoSeries([new_gon_merc], crs=m_crs).to_crs(self.unmapped_polygons.crs).iloc[0]
                 shrunk.append(new_gon)
 
         self.unmapped_polygons = gpd.GeoDataFrame(geometry=shrunk, crs=self.unmapped_polygons.crs)
@@ -927,13 +958,13 @@ class Map:
         grown = []
         for pgon in self.land_polygons.geometry:
             centroid = pgon.centroid
-            
+            m_crs = metric_crs(centroid.x)
             pgon_merc = gpd.GeoSeries([pgon], crs=self.land_polygons.crs)
 
-            pgon_merc = pgon_merc.to_crs(web_mercator).iloc[0]
+            pgon_merc = pgon_merc.to_crs(m_crs).iloc[0]
             new_gon_merc = pgon_merc.buffer(land_buffer_width)
             if new_gon_merc.area > 0:
-                new_gon = gpd.GeoSeries([new_gon_merc], crs=web_mercator).to_crs(self.land_polygons.crs).iloc[0]
+                new_gon = gpd.GeoSeries([new_gon_merc], crs=m_crs).to_crs(self.land_polygons.crs).iloc[0]
                 new_gon = new_gon.simplify(.005)
                 grown.append(new_gon)
 
@@ -942,7 +973,7 @@ class Map:
 
     def index_of(self, point):
         transformer = Transformer.from_crs(
-            "EPSG:4326",
+            wgs84,
             self.depth_crs,
             always_xy=True
         )
@@ -951,6 +982,7 @@ class Map:
 
         # Convert to row/col in window
         row, col = rowcol(self.depth_transform, x, y)
+        print("index", col, row, self.depth_raster.shape)
         return int(col), int(row)
 
     def coords_of(self, col, row):
@@ -963,7 +995,7 @@ class Map:
             raise IndexError(f"Pixel out of bounds: row={row}, col={col}, shape={self.depth_raster.shape}")
 
         x, y = rasterio.transform.xy(self.depth_transform, row, col, offset="center")
-        to_wgs84 = Transformer.from_crs(self.depth_crs, "EPSG:4326", always_xy=True)
+        to_wgs84 = Transformer.from_crs(self.depth_crs, wgs84, always_xy=True)
         lon, lat = to_wgs84.transform(x, y)
         return lat, lon
 
@@ -973,7 +1005,7 @@ class Map:
     def in_radius_of(self, point, radius):
         col, row = self.index_of(point)
         
-        transformer = Transformer.from_crs("EPSG:4326", "EPSG:32634", always_xy=True)
+        transformer = Transformer.from_crs(wgs84, "EPSG:32634", always_xy=True)
         
         x1, y1 = rasterio.transform.xy(self.depth_transform, row, col)
         x1_m, y1_m = transformer.transform(x1, y1)
@@ -1014,7 +1046,7 @@ class Map:
             col = self.depth_raster.shape[1]-1
         # print(col, row)
         # print(self.depth_raster.shape)
-        # print( self.depth_raster[row, col])
+        print( "depth", self.depth_raster[row, col])
         return self.depth_raster[row, col]
 
     def width_at_depth(self, depth):
@@ -1034,11 +1066,10 @@ class Map:
 
 
     def survey_line(self, line, step = 1000):
-        centroid = line.geometry.iloc[0].centroid
-        crs = metric_crs(centroid.x)
-        gdf_m = line.to_crs(crs)
+        gdf_m = line
+        print("segment", line.to_crs(wgs84).geometry.iloc[0])
         line_m = gdf_m.geometry.iloc[0]
-        to_wgs84 = Transformer.from_crs(crs, wgs84, always_xy=True)
+        to_wgs84 = Transformer.from_crs(line.crs, wgs84, always_xy=True)
 
         length = line_m.length
         distances = list(np.arange(0, length, step))
@@ -1075,6 +1106,7 @@ class Map:
             p_wgs84 = Point(lon, lat)
             try:
                 w = self.width_at(p_wgs84) / 2.0   # meters
+                print("width",p_wgs84, w)
             except:
                 continue
             left = Point(p.x + n[0]*w, p.y + n[1]*w)
@@ -1089,39 +1121,42 @@ class Map:
             # print(left, right)
 
         poly_m = Polygon(list(left_pts) + list(reversed(right_pts)))
-        poly_wgs84 = gpd.GeoSeries([poly_m], crs=crs).to_crs(wgs84).iloc[0]
+        poly_wgs84 = gpd.GeoSeries([poly_m], crs=line.crs).to_crs(wgs84).iloc[0]
         poly_gdf = gpd.GeoDataFrame(geometry=[poly_wgs84], crs=wgs84)
 
-        lefts = gpd.GeoDataFrame(geometry = [LineString(list(left_pts))], crs = crs).to_crs(wgs84)
-        rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = crs).to_crs(wgs84)
+        lefts = gpd.GeoDataFrame(geometry = [LineString(list(left_pts))], crs = line.crs).to_crs(wgs84)
+        rights = gpd.GeoDataFrame(geometry = [LineString(list(right_pts))], crs = line.crs).to_crs(wgs84)
         return poly_gdf, lefts, rights
 
     def simple_survey_line(self, line):
-        centroid = line.geometry.iloc[0].centroid
-        crs = metric_crs(centroid.x)
+        print("line", line.to_crs(wgs84).to_json())
         segments = [
             LineString([start, end])
             for l in line.geometry
-            for start, end in zip(l.coords[:-1], l.coords[1:])
+            for part in (l.geoms if hasattr(l, 'geoms') else [l])
+            for start, end in zip(part.coords[:-1], part.coords[1:])
         ]
         segments_gdf = gpd.GeoDataFrame(geometry=segments, crs=line.crs)
         segmented = []
 
         for segment in segments_gdf.geometry:
+            
             segment = gpd.GeoDataFrame(geometry=[segment], crs=line.crs)
+            print("seg", segment.to_crs(wgs84).geometry.iloc[0])
             poly, _, _ = self.survey_line(segment)
-            segmented.append(poly)
+            print("poly", poly.to_crs(wgs84).to_json())
+            segmented.append(poly.to_crs(line.crs))
         segmented = gpd.GeoDataFrame(geometry = pd.concat(segmented).geometry, crs = line.crs)
 
-        segmented_union = segmented.to_crs(crs).union_all()
-        segmented = gpd.GeoDataFrame(geometry=[segmented_union], crs=crs).to_crs(line.crs)
+        segmented_union = segmented.union_all()
+        segmented = gpd.GeoDataFrame(geometry=[segmented_union], crs=line.crs).to_crs(wgs84)
         return segmented
         
 
     def survey_line_3D(self, line):
         gdf_m = line.to_crs(metric_crs)
         line_m = gdf_m.geometry.iloc[0]
-        to_wgs84 = Transformer.from_crs(metric_crs, "EPSG:4326", always_xy=True)
+        to_wgs84 = Transformer.from_crs(metric_crs, utils.wgs84, always_xy=True)
         
         lon0, lat0 = line.loc[0].geometry.coords[0]
 
@@ -1186,7 +1221,7 @@ def get_polys():
         glc_simp = gpd.read_feather("glc_simp.feather")
         guc_simp = gpd.read_feather("guc_simp.feather")
         glc_orig = gpd.read_feather("glc_orig.feather")
-        return glc_simp, guc_simp, glc_orig, get_center(glc_simp.to_crs(epsg=4326))
+        return glc_simp, guc_simp, glc_orig, get_center(glc_simp.to_crs(wgs84))
     guc_simp = gpd.read_file("GebcoHICrop/guc.json")
     guc_simp = guc_simp.to_crs('ESRI:54009')
     ind = np.argsort(-guc_simp.geometry.area)
@@ -1217,7 +1252,7 @@ def get_polys():
     glc_simp.to_feather("glc_simp.feather")
     glc_orig.to_feather("glc_orig.feather")
     guc_simp.to_feather("guc_simp.feather")
-    return glc_simp.to_crs(epsg=4326), guc_simp.to_crs(epsg=4326), glc_orig.to_crs(epsg=4326), get_center(glc_simp.to_crs(epsg=4326))
+    return glc_simp.to_crs(wgs84), guc_simp.to_crs(wgs84), glc_orig.to_crs(wgs84), get_center(glc_simp.to_crs(wgs84))
 
 def get_center(_glc_simp):
     center = _glc_simp.union_all().centroid
