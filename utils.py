@@ -684,6 +684,12 @@ class Map:
             geometry=[merged], crs=self.unmapped_polygons.crs
         ).explode(index_parts=False, ignore_index=True)
         self.shrink_unmapped_polygons()
+        gon_score = []
+        for idx, row in self.unmapped_polygons.iterrows():
+            ce = row.geometry.centroid
+            score = self.width_at(ce)
+            gon_score.append(score)
+        self.unmapped_scores = pd.Series(gon_score, index=self.unmapped_polygons.index)
 
     def polygonize_seafloor(self, nodata=None):
         """Create a PyVista StructuredGrid seafloor surface in ``metric_crs``.
