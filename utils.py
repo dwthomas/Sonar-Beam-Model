@@ -527,6 +527,7 @@ def load_gebco_region(tile_paths: list[str], polygon):
         #         # Check longitude overlap accounting for dateline wrapping
         #         if _lon_ranges_overlap(b.left, b.right, min_lon, max_lon):
         overlapping.append(path)
+    print(overlapping)
 
     if not overlapping:
         raise ValueError("No GEBCO tiles overlap the requested polygon.")
@@ -1170,7 +1171,15 @@ class Map:
             poly, _, _ = self.survey_line(segment)
             # print("poly", poly.to_crs(wgs84).to_json())
             segmented.append(poly.to_crs(line.crs))
+            final_point_wgs84 = segment.to_crs(wgs84).geometry.iloc[0].coords[-1]
+            final_point = segment.geometry.iloc[0].coords[-1]
+            width = self.width_at(Point(final_point_wgs84))
+            endcircle = Point(final_point).buffer(width/2)
+            endcircle_gdf = gpd.GeoDataFrame(geometry=[endcircle], crs=line.crs)
+            segmented.append(endcircle_gdf.to_crs(line.crs))
+
         segmented = gpd.GeoDataFrame(geometry = pd.concat(segmented).geometry, crs = line.crs)
+        # print("segmented", segmented.to_crs(wgs84).to_json())
 
         segmented_union = segmented.union_all()
         segmented = gpd.GeoDataFrame(geometry=[segmented_union], crs=line.crs).to_crs(wgs84)
