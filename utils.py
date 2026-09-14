@@ -527,7 +527,7 @@ def load_gebco_region(tile_paths: list[str], polygon):
         #         # Check longitude overlap accounting for dateline wrapping
         #         if _lon_ranges_overlap(b.left, b.right, min_lon, max_lon):
         overlapping.append(path)
-    print(overlapping)
+    # print(overlapping)
 
     if not overlapping:
         raise ValueError("No GEBCO tiles overlap the requested polygon.")
