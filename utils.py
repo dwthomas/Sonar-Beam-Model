@@ -606,7 +606,7 @@ class Map:
         print("Loading beam data...", file=sys.stderr)
         self.beam = load_beam(extinction_file)
         print("Loading GEBCO TID Raster...", file=sys.stderr)
-        tid_files = glob.glob(os.path.join(gebco_folder, "*_tid_*.tif"))
+        tid_files = glob.glob(os.path.join(gebco_folder, "*tid*"))
         self.land_raster, self.land_transform, self.land_crs = load_gebco_region(tid_files, mask)
 
         print("Loading GEBCO unmapped Raster...", file=sys.stderr)
@@ -624,7 +624,7 @@ class Map:
         # ) as dst:
         #     dst.write(self.tid_raster, 1)
         print("Loading GEBCO Depth Raster...", file=sys.stderr)
-        depth_files = glob.glob(os.path.join(gebco_folder, "*_sub_ice_*.tif"))
+        depth_files = glob.glob(os.path.join(gebco_folder, "*sub_ice*"))
         self.depth_raster, self.depth_transform, self.depth_crs = load_gebco_region(depth_files, mask)
         # with rasterio.open(
         #     "tmpdepth.tif",
