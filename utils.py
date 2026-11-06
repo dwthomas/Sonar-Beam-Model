@@ -60,6 +60,16 @@ def xy_displacement_to_latlon(xs, ys, lon0, lat0):
     lons, lats = transformer.transform(xs, ys)
     return lons, lats
 
+def collapse(geom, ratio_threshold=2.0):
+    rect = geom.minimum_rotated_rectangle
+    coords = list(rect.exterior.coords)[:4]
+    sides = [LineString([coords[i], coords[(i + 1) % 4]]) for i in range(4)]
+    lengths = [s.length for s in sides]
+    if min(lengths) == 0 or max(lengths) / min(lengths) < ratio_threshold:
+        return geom.representative_point()
+    # line through midpoints of the two short sides
+    short = sorted(range(4), key=lambda i: lengths[i])[:2]
+    return LineString([sides[i].interpolate(0.5, normalized=True) for i in short])
 
 def dem_to_structuredgrid(depth_grid, transform, lon0, lat0):
     """
@@ -684,6 +694,13 @@ class Map:
         self.unmapped_polygons = gpd.GeoDataFrame(
             geometry=[merged], crs=self.unmapped_polygons.crs
         ).explode(index_parts=False, ignore_index=True)
+        self.unmapped_lines = gpd.GeoDataFrame(
+            geometry=[], crs=self.unmapped_polygons.crs
+        )
+        self.unmapped_points = gpd.GeoDataFrame(
+            geometry=[], crs=self.unmapped_polygons.crs
+        )
+        
         self.shrink_unmapped_polygons()
         gon_score = []
         for idx, row in self.unmapped_polygons.iterrows():
@@ -962,6 +979,8 @@ class Map:
 
     def shrink_unmapped_polygons(self, overlap_factor = 0.15):
         shrunk = []
+        shrunk_lines = []
+        shrunk_points = []
         for pgon in self.unmapped_polygons.geometry:
             centroid = pgon.centroid
             m_crs = metric_crs(centroid.x)
@@ -976,8 +995,18 @@ class Map:
             if new_gon_merc.area > 0:
                 new_gon = gpd.GeoSeries([new_gon_merc], crs=m_crs).to_crs(self.unmapped_polygons.crs).iloc[0]
                 shrunk.append(new_gon)
+            else:
+                new_geo = collapse(pgon_merc)
+                if new_geo.geom_type == 'LineString':
+                    new_line = gpd.GeoSeries([new_geo], crs = m_crs).to_crs(self.unmapped_polygons.crs).iloc[0]
+                    shrunk_lines.append(new_line)
+                elif new_geo.geom_type == "Point":
+                    new_point = gpd.GeoSeries([new_geo], crs = m_crs).to_crs(self.unmapped_polygons.crs).iloc[0]
+                    shrunk_points.append(new_point)
 
         self.unmapped_polygons = gpd.GeoDataFrame(geometry=shrunk, crs=self.unmapped_polygons.crs)
+        self.unmapped_lines = gpd.GeoDataFrame(geometry=shrunk_lines, crs=self.unmapped_polygons.crs)
+        self.unmapped_points = gpd.GeoDataFrame(geometry=shrunk_points, crs=self.unmapped_polygons.crs)
 
     def grow_land_polygons(self):
         grown = []
